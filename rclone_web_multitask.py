@@ -457,33 +457,38 @@ def run_sync(task_config, task_id='task_1'):
             line = line.strip()
             if line:
                 # 解析进度信息
-                if 'Transferred:' in line and '/' in line:
+                if 'Transferred:' in line:
                     try:
                         parts = line.split('Transferred:')[1].strip()
-                        if '/' in parts:
-                            transferred_total = parts.split(',')[0].strip()
-                            transferred, total = transferred_total.split('/')
-                            sync_status['tasks'][task_id]['progress']['transferred'] = transferred.strip()
-                            sync_status['tasks'][task_id]['progress']['total'] = total.strip()
-                            
-                            if '%' in parts:
-                                percentage = re.search(r'(\d+)%', parts)
-                                if percentage:
-                                    sync_status['tasks'][task_id]['progress']['percentage'] = int(percentage.group(1))
-                            
-                            speed_match = re.search(r'([\d.]+\s*[KMGT]?i?B/s)', parts)
-                            if speed_match:
-                                sync_status['tasks'][task_id]['progress']['speed'] = speed_match.group(1)
-                            
-                            eta_match = re.search(r'ETA\s+(\S+)', parts)
-                            if eta_match:
-                                sync_status['tasks'][task_id]['progress']['eta'] = eta_match.group(1)
-                    except:
-                        pass
+                        
+                        # 解析传输量: "1.234 GiB / 5.678 GiB" 或 "1.234G / 5.678G"
+                        transfer_match = re.search(r'([\d.]+\s*[KMGT]?i?B)\s*/\s*([\d.]+\s*[KMGT]?i?B)', parts)
+                        if transfer_match:
+                            sync_status['tasks'][task_id]['progress']['transferred'] = transfer_match.group(1).strip()
+                            sync_status['tasks'][task_id]['progress']['total'] = transfer_match.group(2).strip()
+                        
+                        # 解析百分比
+                        percent_match = re.search(r'(\d+)%', parts)
+                        if percent_match:
+                            sync_status['tasks'][task_id]['progress']['percentage'] = int(percent_match.group(1))
+                        
+                        # 解析速度
+                        speed_match = re.search(r'([\d.]+\s*[KMGT]?i?B/s)', parts)
+                        if speed_match:
+                            sync_status['tasks'][task_id]['progress']['speed'] = speed_match.group(1).strip()
+                        
+                        # 解析ETA
+                        eta_match = re.search(r'ETA[:\s]+([\dhms:]+)', parts)
+                        if eta_match:
+                            sync_status['tasks'][task_id]['progress']['eta'] = eta_match.group(1).strip()
+                        
+                    except Exception as e:
+                        log_message('warning', f'解析进度失败: {str(e)} - 行: {line}')
                 
+                # 解析当前文件
                 if line.startswith('*') or 'Transferring:' in line:
                     try:
-                        filename = re.search(r'\*\s+(.+?):', line)
+                        filename = re.search(r'\*\s*(.+?):', line)
                         if filename:
                             sync_status['tasks'][task_id]['progress']['current_file'] = filename.group(1).strip()
                     except:
@@ -659,6 +664,55 @@ class RcloneWebHandler(http.server.SimpleHTTPRequestHandler):
                 else:
                     self.send_json({'success': False, 'message': '删除失败'})
             except Exception as e:
+                self.send_json({'success': False, 'message': str(e)})
+        
+        elif self.path == '/api/s3/get':
+            try:
+                data = json.loads(post_data.decode())
+                name = data.get('name')
+                if not name:
+                    self.send_json({'success': False, 'message': '缺少远程名称'})
+                    return
+                
+                config = get_s3_remote_config(name)
+                if config:
+                    self.send_json({'success': True, 'config': config})
+                else:
+                    self.send_json({'success': False, 'message': '未找到配置'})
+            except Exception as e:
+                self.send_json({'success': False, 'message': str(e)})
+        
+        elif self.path == '/api/s3/update':
+            try:
+                data = json.loads(post_data.decode())
+                name = data.get('name')
+                access_key = data.get('accessKey') or data.get('access_key')
+                secret_key = data.get('secretKey') or data.get('secret_key')
+                endpoint = data.get('endpoint')
+                region = data.get('region', 'auto')
+                provider = data.get('provider', 'Other')
+                force_path_style = data.get('forcePathStyle', data.get('force_path_style', True))
+                
+                if not all([name, access_key, secret_key, endpoint]):
+                    self.send_json({'success': False, 'message': '缺少必填字段'})
+                    return
+                
+                # 更新就是重新添加（会覆盖旧配置）
+                success = add_s3_remote(
+                    name,
+                    access_key,
+                    secret_key,
+                    endpoint,
+                    region,
+                    provider,
+                    force_path_style
+                )
+                if success:
+                    self.send_json({'success': True, 'message': 'S3配置已更新'})
+                else:
+                    self.send_json({'success': False, 'message': '更新失败'})
+            except Exception as e:
+                log_message('error', f'S3更新API错误: {str(e)}')
                 self.send_json({'success': False, 'message': str(e)})
         
         elif self.path == '/api/task/add':
@@ -1044,7 +1098,7 @@ HTML_PAGE = """<!DOCTYPE html>
             </div>
             
             <button class="btn-primary" id="s3SubmitBtn" onclick="saveS3Remote()">✅ 添加配置</button>
-            <button class="btn-secondary" onclick="toggleS3Form()">取消</button>
+            <button class="btn-secondary" onclick="cancelS3Form()">取消</button>
         </div>
         
         <!-- 日志 -->
@@ -1313,6 +1367,7 @@ HTML_PAGE = """<!DOCTYPE html>
                     <div class="s3-item">
                         <span class="badge">${remote}</span>
                         <div>
+                            <button class="btn-sm btn-primary" onclick="editS3('${remote}')" style="padding: 5px 10px; font-size: 11px; margin-right: 5px;">编辑</button>
                             <button class="btn-sm btn-delete" onclick="deleteS3('${remote}')" style="padding: 5px 10px; font-size: 11px;">删除</button>
                         </div>
                     </div>
@@ -1326,6 +1381,7 @@ HTML_PAGE = """<!DOCTYPE html>
         }
         
         async function saveS3Remote() {
+            if (window.s3EditMode) { await updateS3Remote(window.s3EditMode); return; }
             const data = {
                 name: document.getElementById('s3Name').value,
                 access_key: document.getElementById('s3AccessKey').value,
@@ -1351,7 +1407,7 @@ HTML_PAGE = """<!DOCTYPE html>
                 
                 if (result.success) {
                     alert('S3配置添加成功！');
-                    toggleS3Form();
+                    cancelS3Form();
                     loadS3Remotes();
                 } else {
                     alert('添加失败: ' + result.message);
@@ -1381,6 +1437,89 @@ HTML_PAGE = """<!DOCTYPE html>
             } catch (error) {
                 alert('删除失败: ' + error.message);
             }
+        }
+        
+        async function editS3(remoteName) {
+            try {
+                const res = await fetch('/api/s3/get', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: remoteName })
+                });
+                const result = await res.json();
+                
+                if (!result.success) {
+                    alert('获取配置失败: ' + result.message);
+                    return;
+                }
+                
+                const config = result.config;
+                document.getElementById('s3Name').value = config.name || remoteName;
+                document.getElementById('s3Name').readOnly = true;
+                document.getElementById('s3AccessKey').value = config.access_key_id || '';
+                document.getElementById('s3SecretKey').value = config.secret_access_key || '';
+                document.getElementById('s3Endpoint').value = config.endpoint || '';
+                document.getElementById('s3Region').value = config.region || 'auto';
+                document.getElementById('s3Provider').value = config.provider || 'Other';
+                document.getElementById('s3ForcePathStyle').checked = config.force_path_style === 'true';
+                
+                const form = document.getElementById('s3Form');
+                form.classList.remove('hidden');
+                
+                window.s3EditMode = remoteName;
+            } catch (error) {
+                alert('获取配置失败: ' + error.message);
+            }
+        }
+        
+        async function updateS3Remote(originalName) {
+            const data = {
+                name: originalName,
+                accessKey: document.getElementById('s3AccessKey').value,
+                secretKey: document.getElementById('s3SecretKey').value,
+                endpoint: document.getElementById('s3Endpoint').value,
+                region: document.getElementById('s3Region').value,
+                provider: document.getElementById('s3Provider').value,
+                forcePathStyle: document.getElementById('s3ForcePathStyle').checked
+            };
+            
+            if (!data.accessKey || !data.secretKey || !data.endpoint) {
+                alert('请填写所有必填项');
+                return;
+            }
+            
+            try {
+                const res = await fetch('/api/s3/update', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+                const result = await res.json();
+                
+                if (result.success) {
+                    alert('S3配置已更新！');
+                    cancelS3Form();
+                    await loadS3Remotes();
+                } else {
+                    alert('更新失败: ' + result.message);
+                }
+            } catch (error) {
+                alert('更新失败: ' + error.message);
+            }
+        }
+        
+        function cancelS3Form() {
+            const form = document.getElementById('s3Form');
+            form.classList.add('hidden');
+            document.getElementById('s3Name').value = '';
+            document.getElementById('s3Name').readOnly = false;
+            document.getElementById('s3AccessKey').value = '';
+            document.getElementById('s3SecretKey').value = '';
+            document.getElementById('s3Endpoint').value = '';
+            document.getElementById('s3Region').value = 'auto';
+            document.getElementById('s3Provider').value = 'Other';
+            document.getElementById('s3ForcePathStyle').checked = true;
+            window.s3EditMode = null;
         }
         
         async function loadLogs() {
